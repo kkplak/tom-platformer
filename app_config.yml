@@ -1,0 +1,15 @@
+# The app_config.yml file is used to configure the app.
+# project_name: The name of the project.
+promotion: poc-tomandjerry
+# node_version: The version of node to use.
+node_version: 18
+# module_source: The source of the modules (npm or bit).
+module_source: npm
+# locale_default: The default locale.
+locale_default: en-US
+# source_folder: The source folder. (root folder or sub folder)
+source_folder: .
+# build_folder: The build folder. (build, dist, etc)
+build_folder: build
+# build_app: Build the app. (true or false)
+build_app: true

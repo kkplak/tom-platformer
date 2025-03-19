@@ -1,0 +1,323 @@
+# DO NOT CHANGE THIS FILE
+# This file is managed by the TMSW GitHub Actions team
+
+name: Build, Publish, Deploy Powerup
+on:
+  push:
+    branches:
+      - main
+      - release/1.x.x
+      #- feature-github-actions
+      - snapshot/*
+  pull_request:
+    branches:
+      - release/1.x.x
+      - main
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'final'
+        type: choice
+        options:
+          - candidate
+          - final
+
+permissions:
+  contents: write
+env:
+    # dont change these
+    AWS_REGION: us-east-1
+    AWS_S3_ARTIFACT_BUCKET: tmswglobaldev-happymeal-fe-2022-us-hmpu
+    AWS_S3_DEPLOY_BUCKET: dev.tms-hmpu.com
+    CDN_DISTRO: E2CUUN4HPJDCA7
+    JENKINS_SERVER: jenkins-sso-github.tms-shared-services.com
+    BUILD_TYPE: ${{ github.event.inputs.build_type || 'candidate' }} # candidate or final
+    SLACK_CHANNEL: C07C39RG98X # gh-hmpu
+    CI: false # false: ignore warnings, true: warnings are errors
+jobs:
+  pipeline_start:
+    name: Start of Pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Build Start to a Slack Channel
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          # Available in the slack channel info. Also, this app tms-github-actions must be invited to the channel
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            Build started by: ${{ github.triggering_actor	}}
+            Repository: ${{ github.repository }}
+            Event: ${{ github.event_name }}
+            Branch: ${{ github.ref_name }}
+            URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env: 
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  read_config:
+    name: Read Config
+    runs-on: ubuntu-latest
+    needs: pipeline_start
+    outputs:
+      promotion: ${{ steps.read_config.outputs.PROMOTION }}
+      node_version: ${{ steps.read_config.outputs.NODE_VERSION }}
+      module_source: ${{ steps.read_config.outputs.MODULE_SOURCE }}
+      locale_default: ${{ steps.read_config.outputs.LOCALE_DEFAULT }}
+      source_folder: ${{ steps.read_config.outputs.SOURCE_FOLDER }}
+      build_folder: ${{ steps.read_config.outputs.BUILD_FOLDER }}
+      build_app: ${{ steps.read_config.outputs.BUILD_APP }}
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read Config
+        id: read_config
+        run: |
+          echo "PROMOTION=$(yq '.promotion' app_config.yml)" >> "$GITHUB_OUTPUT"
+          NODE_VERSION=$(yq '.node_version // "18"' app_config.yml)
+          echo "NODE_VERSION=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+          MODULE_SOURCE=$(yq '.module_source // "npm"' app_config.yml)
+          echo "MODULE_SOURCE=$MODULE_SOURCE" >> "$GITHUB_OUTPUT"
+          LOCALE_DEFAULT=$(yq '.locale_default // "en-US"' app_config.yml)
+          echo "LOCALE_DEFAULT=$LOCALE_DEFAULT" >> "$GITHUB_OUTPUT"
+          SOURCE_FOLDER=$(yq '.source_folder // "."' app_config.yml)
+          echo "SOURCE_FOLDER=$SOURCE_FOLDER" >> "$GITHUB_OUTPUT"
+          BUILD_FOLDER=$(yq '.build_folder // "."' app_config.yml)
+          echo "BUILD_FOLDER=$BUILD_FOLDER" >> "$GITHUB_OUTPUT"
+          BUILD_APP=$(yq '.build_app // "false"' app_config.yml)
+          echo "BUILD_APP=$BUILD_APP" >> "$GITHUB_OUTPUT"
+
+      - name: Display Config Values
+        run: |
+          echo "promotion: ${{ steps.read_config.outputs.promotion }}"
+          echo "node_version: ${{ steps.read_config.outputs.node_version }}"
+          echo "module_source: ${{ steps.read_config.outputs.module_source }}"
+          echo "locale_default: ${{ steps.read_config.outputs.locale_default }}"
+          echo "source_folder: ${{ steps.read_config.outputs.source_folder }}"
+          echo "build_folder: ${{ steps.read_config.outputs.build_folder }}"
+          echo "build_app: ${{ steps.read_config.outputs.build_app }}"
+
+  set_environment:
+    name: Set Environment
+    runs-on: ubuntu-latest
+    needs: read_config
+    if : needs.read_config.outputs.build_app == 'true'
+    outputs:
+      app_environment: ${{ steps.set_environment.outputs.APP_ENVIRONMENT }}
+      build_type: ${{ steps.set_environment.outputs.BUILD_TYPE }}
+      build_location: ${{ steps.set_environment.outputs.BUILD_LOCATION }}
+    steps:
+      - name: Set Environment
+        id: set_environment
+        run: |
+          if [[ "${{ env.BUILD_TYPE }}" == "final" ]]; then
+            echo "APP_ENVIRONMENT=production" >> "$GITHUB_OUTPUT"
+            echo "BUILD_TYPE=final" >> "$GITHUB_OUTPUT"
+            echo "BUILD_LOCATION=prod" >> "$GITHUB_OUTPUT"
+          else
+            echo "APP_ENVIRONMENT=development" >> "$GITHUB_OUTPUT"
+            echo "BUILD_TYPE=candidate" >> "$GITHUB_OUTPUT"
+            echo "BUILD_LOCATION=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Display Environment
+        run: |
+          echo "app_environment: ${{ steps.set_environment.outputs.app_environment }}"
+          echo "build_type: ${{ steps.set_environment.outputs.build_type }}"
+          echo "build_location: ${{ steps.set_environment.outputs.build_location }}"
+        
+  build_and_publish:
+    name: Build and Publish to S3
+    runs-on: ubuntu-latest
+    needs: [ read_config, set_environment ]
+    if : needs.read_config.outputs.build_app == 'true'
+    outputs:
+      version_tag: ${{ steps.set_version.outputs.APP_VERSION }}
+      build_status: ${{ steps.build_project.outputs.BUILD_STATUS }}
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get Next Version Tag
+        id: next_version
+        uses: paulhatch/semantic-version@v5.3.0
+        with:
+          # The prefix to use to identify tags
+          tag_prefix: "v"
+          # A string to determine the format of the version output
+          #version_format: "${major}.${minor}.${patch}-rc.${increment}"
+          version_format: "v${major}.${minor}.${patch}-rc.${increment}"
+          # If this is set to true, *every* commit will be treated as a new version.
+          bump_each_commit: false
+
+      - name: Set Tag Version
+        id: set_version
+        run: |
+          if [[ "${{ startsWith(github.ref_name, 'snapshot') }}" == "true" ]]; then
+            echo "version: ${{ github.ref_name }}"
+            echo "APP_VERSION=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            if [[ "${{ env.BUILD_TYPE }}" == "final" ]]; then
+              echo "version: ${{ steps.next_version.outputs.version_tag }}"
+              echo "APP_VERSION=${{ steps.next_version.outputs.version_tag }}" >> "$GITHUB_OUTPUT"
+            else
+              echo "version: ${{ steps.next_version.outputs.version }}"
+              echo "APP_VERSION=${{ steps.next_version.outputs.version }}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Display Tag Versions
+        run: |
+          echo "version (raw): ${{ steps.next_version.outputs.version }}"
+          echo "version_tag (raw): ${{ steps.next_version.outputs.version_tag }}"
+          echo "APP_VERSION: ${{ steps.set_version.outputs.APP_VERSION }}"
+
+      - name: Install Node.js ${{ needs.read_config.outputs.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.read_config.outputs.node_version }}
+
+      - name: Install pnpm
+        run: |
+          npm install -g pnpm
+
+      - name: Configure pnpm
+        run: |
+          if [[ "${{ needs.read_config.outputs.module_source }}" == "npm" ]]; then
+            echo "Module Source: npm"
+            pnpm config set always-auth true --location project
+            pnpm config set //registry.npmjs.org/:_authToken=${{ secrets.HM_NPM_AUTH_TOKEN }} --location project
+          else
+            echo "Module Source: bit"
+            pnpm config set always-auth true --location project
+            pnpm config set @teambit:registry=https://node-registry.bit.cloud --location project
+            pnpm config set @tmsw:registry=https://node-registry.bit.cloud --location project
+            pnpm config set //node-registry.bit.cloud/:_authToken=${{ secrets.HM_BIT_AUTH_TOKEN }} --location project
+          fi
+          cat .npmrc
+        working-directory: ${{ needs.read_config.outputs.source_folder }}
+
+      - name: Install pnpm dependencies
+        run: |
+          pnpm install --force
+        working-directory: ${{ needs.read_config.outputs.source_folder }}
+
+        # Build section may require project specific tweaks
+      - name: Build the project
+        id: build_project
+        run: |
+            pnpm run build:${{ needs.set_environment.outputs.app_environment }}
+            if [ -d "${{ needs.read_config.outputs.build_folder }}" ]; then
+              echo $APP_VERSION > ./${{ needs.read_config.outputs.build_folder }}/version.txt
+              echo "BUILD_STATUS=success" >> "$GITHUB_OUTPUT"
+            else
+              echo "BUILD_STATUS=failed" >> "$GITHUB_OUTPUT"
+            fi
+        env:
+          NODE_ENV: ${{ needs.set_environment.outputs.app_environment }}
+          LOCALE_DEFAULT: ${{ needs.read_config.outputs.locale_default }}
+          APP_VERSION: ${{ steps.set_version.outputs.APP_VERSION }}
+          REACT_APP_NAME: ${{ needs.read_config.outputs.promotion }}
+
+          # Custom environment variables needed for building the project
+
+        working-directory: ${{ needs.read_config.outputs.source_folder }}
+
+      - name: Configure AWS credentials
+        if: |
+          steps.build_project.outputs.BUILD_STATUS == 'success' && 
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.HM_ARTIFACT_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.HM_ARTIFACT_AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push files to S3
+        if: |
+          steps.build_project.outputs.BUILD_STATUS == 'success' && 
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          echo "SRC_S3_BUCKET: ${{ env.AWS_S3_ARTIFACT_BUCKET }}"
+          echo "PROMOTION: ${{ needs.read_config.outputs.promotion }}"
+          echo "VERSION_TAG: ${{ steps.set_version.outputs.APP_VERSION }}"
+          echo "BUILD: ${{ needs.set_environment.outputs.build_location }}"
+          if [ -d "${{ needs.read_config.outputs.build_folder }}" ]; then
+            aws s3 cp ./${{ needs.read_config.outputs.build_folder }} s3://${{ env.AWS_S3_ARTIFACT_BUCKET }}/${{ needs.read_config.outputs.promotion }}/${{ steps.set_version.outputs.APP_VERSION }}/${{ needs.set_environment.outputs.build_location }}/main --recursive
+          fi
+        working-directory: ${{ needs.read_config.outputs.source_folder }}
+
+      - name: Create Tag
+        if: |
+          steps.build_project.outputs.BUILD_STATUS == 'success' && 
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 
+          startsWith(github.ref_name, 'snapshot') == false
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: 'refs/tags/${{ steps.set_version.outputs.APP_VERSION }}',
+              sha: context.sha
+            })
+
+  deploy:
+    name: Deploy with Jenkins to Dev
+    runs-on: ubuntu-latest
+    needs: [ read_config, set_environment, build_and_publish ]
+    if: |
+      needs.build_and_publish.outputs.build_status == 'success' && 
+      needs.read_config.outputs.build_app == 'true' && 
+      github.event_name == 'push' && 
+      startsWith(github.ref_name, 'snapshot') == false 
+    env:
+      VERSION_TAG: ${{ needs.build_and_publish.outputs.version_tag }}
+      JENKINS_HOST_HEADER: ${{ secrets.HM_JENKINS_HOST_HEADER }}
+      JENKINS_AUTH_TOKEN: ${{ secrets.HM_JENKINS_AUTH_TOKEN }}
+      BUILD: ${{ needs.set_environment.outputs.build_location }}
+    steps:
+
+      - name: Print Environment
+        run: |
+          echo "AWS_S3_ARTIFACT_BUCKET: ${{ env.AWS_S3_ARTIFACT_BUCKET }}"
+          echo "AWS_S3_DEPLOY_BUCKET: ${{ env.AWS_S3_DEPLOY_BUCKET }}"
+          echo "PROMOTION: ${{ needs.read_config.outputs.promotion }}"
+          echo "VERSION_TAG: ${{ env.VERSION_TAG }}"
+          echo "JENKINS_SERVER: ${{ env.JENKINS_SERVER }}"
+          echo "JENKINS_HOST_HEADER: ${{ env.JENKINS_HOST_HEADER }}"
+          echo "JENKINS_AUTH_TOKEN: ${{ env.JENKINS_AUTH_TOKEN }}"
+          echo "BUILD: ${{ env.BUILD }}"
+          echo "CDN_DISTRO: ${{ env.CDN_DISTRO }}"
+
+      - name: Trigger Jenkins Job
+        run: |
+          curl -v -H "${{ env.JENKINS_HOST_HEADER }}" -X POST "https://${{ env.JENKINS_SERVER }}/buildByToken/buildWithParameters?job=Happymeal/Powerups/Powerups%20Lower%20Environment/Powerup_FE_Lower_Env_Deployments&token=${{ env.JENKINS_AUTH_TOKEN }}&source_s3_bucket=${{ env.AWS_S3_ARTIFACT_BUCKET }}&promotion_name=${{ needs.read_config.outputs.promotion }}&version=${{ env.VERSION_TAG }}&build=${{ env.BUILD }}&content=main&destination_bucket=${{ env.AWS_S3_DEPLOY_BUCKET }}&cdn_distro=${{ env.CDN_DISTRO }}"
+        shell: bash
+
+  pipeline_end:
+    name: End of Pipeline
+    runs-on: ubuntu-latest
+    needs: [build_and_publish, deploy]
+    if: ${{ always () }}
+    steps:
+      - name: Post Build Finish to a Slack Channel
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          # Available in the slack channel info. Also, this app tms-github-actions must be invited to the channel
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            Build Finished:
+            Repository: ${{ github.repository }}
+            Event: ${{ github.event_name }}
+            Branch: ${{ github.ref_name }}
+            Version: ${{ needs.build_and_publish.outputs.version_tag }}
+            Status: ${{ needs.build_and_publish.result }}
+        env: 
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
